@@ -1,4 +1,4 @@
-%define main_release 11
+%define main_release 12
 
 %define samba_version 4.2.10
 %define talloc_version 2.0.7
@@ -86,6 +86,8 @@ Patch16: CVE-2016-2126-v4-3.patch
 Patch17: CVE-2017-7494.patch
 Patch18: CVE-2017-12150.patch
 Patch19: CVE-2017-12163.patch
+Patch20: CVE-2017-14746.patch
+Patch21: CVE-2017-15275.patch
 
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
@@ -403,6 +405,8 @@ Placeholder package. Samba AD Domain Controller component is not available.
 %patch17 -p1
 %patch18 -p1
 %patch19 -p1
+%patch20 -p1
+%patch21 -p1
 
 %build
 %global _talloc_lib ,talloc,pytalloc,pytalloc-util
@@ -1334,6 +1338,9 @@ rm -rf %{buildroot}
 %endif # with_libwbclient
 
 %changelog
+* Fri Nov 17 2017 Andreas Schneider <asn@redhat.com> - 4.2.10-12
+- resolves: #1514315 - Fix CVE-2017-14746 and CVE-2017-15275
+
 * Thu Sep 14 2017 Andreas Schneider <asn@redhat.com> - 4.2.10-11
 - resolves: #1491212 - CVE-2017-12150 CVE-2017-12163
 
