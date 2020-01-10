@@ -1,0 +1,35 @@
+Index: samba-4.2.10/wscript
+===================================================================
+--- samba-4.2.10.orig/wscript
++++ samba-4.2.10/wscript
+@@ -201,7 +201,7 @@ def configure(conf):
+         else:
+             # not specified, only build RELROs if supported by compiler
+             need_relro = False
+-        if conf.check_cc(cflags='', ldflags='-Wl,-z,relro,-z,now', mandatory=need_relro,
++        if conf.check_cc(cflags='', ldflags='-Wl,-z,relro', mandatory=need_relro,
+                          msg="Checking compiler for full RELRO support"):
+             conf.env['ENABLE_RELRO'] = True
+ 
+Index: samba-4.2.10/buildtools/wafsamba/wafsamba.py
+===================================================================
+--- samba-4.2.10.orig/buildtools/wafsamba/wafsamba.py
++++ samba-4.2.10/buildtools/wafsamba/wafsamba.py
+@@ -240,7 +240,7 @@ def SAMBA_LIBRARY(bld, libname, source,
+ 
+     ldflags = TO_LIST(ldflags)
+     if bld.env['ENABLE_RELRO'] is True:
+-        ldflags.extend(TO_LIST('-Wl,-z,relro,-z,now'))
++        ldflags.extend(TO_LIST('-Wl,-z,relro'))
+ 
+     features = 'cc cshlib symlink_lib install_lib'
+     if pyext:
+@@ -376,7 +376,7 @@ def SAMBA_BINARY(bld, binname, source,
+         pie_cflags += ' -fPIE'
+         pie_ldflags.extend(TO_LIST('-pie'))
+     if bld.env['ENABLE_RELRO'] is True:
+-        pie_ldflags.extend(TO_LIST('-Wl,-z,relro,-z,now'))
++        pie_ldflags.extend(TO_LIST('-Wl,-z,relro'))
+ 
+     # first create a target for building the object files for this binary
+     # by separating in this way, we avoid recompiling the C files

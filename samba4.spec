@@ -1,4 +1,4 @@
-%define main_release 12
+%define main_release 15
 
 %define samba_version 4.2.10
 %define talloc_version 2.0.7
@@ -88,6 +88,10 @@ Patch18: CVE-2017-12150.patch
 Patch19: CVE-2017-12163.patch
 Patch20: CVE-2017-14746.patch
 Patch21: CVE-2017-15275.patch
+Patch22: CVE-2018-1050.patch
+
+# This removes the -z,now flag from LDFLAGS on ppc64
+Patch100: samba-4.2.10-ppc64_remove_bind_now.patch
 
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
@@ -407,6 +411,11 @@ Placeholder package. Samba AD Domain Controller component is not available.
 %patch19 -p1
 %patch20 -p1
 %patch21 -p1
+%patch22 -p1
+
+%ifarch ppc64 ppc64le
+%patch100 -p1 -b .samba-4.2.10-ppc64_remove_bind_now.patch
+%endif
 
 %build
 %global _talloc_lib ,talloc,pytalloc,pytalloc-util
@@ -487,7 +496,7 @@ CFLAGS="-fno-strict-aliasing %{optflags}" CXXFLAGS="-fno-strict-aliasing %{optfl
         --with-cluster-support \
 %endif
 %if ! %with_pam_smbpass
-        --without-pam_smbpass
+        --without-pam_smbpass \
 %endif
 
 export WAFCACHE=/tmp/wafcache
@@ -1338,14 +1347,20 @@ rm -rf %{buildroot}
 %endif # with_libwbclient
 
 %changelog
+* Wed Mar 14 2018 Andreas Schneider <asn@redhat.com> - 4.2.10-15
+- resolves: #1552005 - Fix CVE-2018-1050
+
+* Tue Jan 02 2018 Andreas Schneider <asn@redhat.com> - 4.2.10-14
+- resolves: #1492780 - Do not build with -Wl,-z,now on ppc64
+
 * Fri Nov 17 2017 Andreas Schneider <asn@redhat.com> - 4.2.10-12
-- resolves: #1514315 - Fix CVE-2017-14746 and CVE-2017-15275
+- resolves: #1514313 - Fix CVE-2017-14746 and CVE-2017-15275
 
 * Thu Sep 14 2017 Andreas Schneider <asn@redhat.com> - 4.2.10-11
-- resolves: #1491212 - CVE-2017-12150 CVE-2017-12163
+- resolves: #1491209 - CVE-2017-12150 CVE-2017-12163
 
 * Thu May 18 2017 Guenther Deschner <gdeschner@redhat.com> - 4.2.10-10
-- resolves: #1450779 - Security fix for CVE-2017-7494
+- resolves: #1450780 - Security fix for CVE-2017-7494
 
 * Fri Dec 16 2016 Andreas Schneider <asn@redhat.com> - 4.2.10-9
 - resolves: #1405358 - CVE-2016-2125 CVE-2016-2126
