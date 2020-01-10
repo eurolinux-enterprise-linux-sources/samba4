@@ -1,0 +1,1009 @@
+From 203193d5b167b5d24911d0438eda65f05eec2b31 Mon Sep 17 00:00:00 2001
+From: Stefan Metzmacher <metze@samba.org>
+Date: Fri, 22 Jan 2016 09:57:04 +0100
+Subject: [PATCH 01/11] s3:libads: setup the msDS-SupportedEncryptionTypes
+ attribute on ldap_add
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We may not have the permission to modify the object after creation.
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Stefan Metzmacher <metze@samba.org>
+Reviewed-by: Björn Jacke <bj@sernet.de>
+Reviewed-by: Günther Deschner <gd@samba.org>
+
+Autobuild-User(master): Stefan Metzmacher <metze@samba.org>
+Autobuild-Date(master): Fri Feb 26 11:30:03 CET 2016 on sn-devel-144
+---
+ source3/libads/ldap.c        | 26 ++++++++++++++++++
+ source3/libnet/libnet_join.c | 65 --------------------------------------------
+ 2 files changed, 26 insertions(+), 65 deletions(-)
+
+diff --git a/source3/libads/ldap.c b/source3/libads/ldap.c
+index 121ba08..125c9d7 100644
+--- a/source3/libads/ldap.c
++++ b/source3/libads/ldap.c
+@@ -29,6 +29,7 @@
+ #include "../libds/common/flags.h"
+ #include "smbldap.h"
+ #include "../libcli/security/security.h"
++#include "../librpc/gen_ndr/netlogon.h"
+ #include "lib/param/loadparm.h"
+ 
+ #ifdef HAVE_LDAP
+@@ -2006,6 +2007,12 @@ ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads, const char *machine_name,
+ 	uint32_t acct_control = ( UF_WORKSTATION_TRUST_ACCOUNT |\
+ 	                        UF_DONT_EXPIRE_PASSWD |\
+ 			        UF_ACCOUNTDISABLE );
++	uint32_t func_level = 0;
++
++	ret = ads_domain_func_level(ads, &func_level);
++	if (!ADS_ERR_OK(ret)) {
++		return ret;
++	}
+ 
+ 	if (!(ctx = talloc_init("ads_add_machine_acct")))
+ 		return ADS_ERROR(LDAP_NO_MEMORY);
+@@ -2041,6 +2048,25 @@ ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads, const char *machine_name,
+ 	ads_mod_strlist(ctx, &mods, "objectClass", objectClass);
+ 	ads_mod_str(ctx, &mods, "userAccountControl", controlstr);
+ 
++	if (func_level >= DS_DOMAIN_FUNCTION_2008) {
++		uint32_t etype_list = ENC_CRC32 | ENC_RSA_MD5 | ENC_RC4_HMAC_MD5;
++		const char *etype_list_str;
++
++#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
++		etype_list |= ENC_HMAC_SHA1_96_AES128;
++#endif
++#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
++		etype_list |= ENC_HMAC_SHA1_96_AES256;
++#endif
++
++		etype_list_str = talloc_asprintf(ctx, "%d", (int)etype_list);
++		if (etype_list_str == NULL) {
++			goto done;
++		}
++		ads_mod_str(ctx, &mods, "msDS-SupportedEncryptionTypes",
++			    etype_list_str);
++	}
++
+ 	ret = ads_gen_add(ads, new_dn, mods);
+ 
+ done:
+diff --git a/source3/libnet/libnet_join.c b/source3/libnet/libnet_join.c
+index d7c7679..5564bd2 100644
+--- a/source3/libnet/libnet_join.c
++++ b/source3/libnet/libnet_join.c
+@@ -605,52 +605,6 @@ static ADS_STATUS libnet_join_set_os_attributes(TALLOC_CTX *mem_ctx,
+ /****************************************************************
+ ****************************************************************/
+ 
+-static ADS_STATUS libnet_join_set_etypes(TALLOC_CTX *mem_ctx,
+-					 struct libnet_JoinCtx *r)
+-{
+-	ADS_STATUS status;
+-	ADS_MODLIST mods;
+-	uint32_t etype_list = ENC_CRC32 | ENC_RSA_MD5 | ENC_RC4_HMAC_MD5;
+-	const char *etype_list_str;
+-
+-#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
+-	etype_list |= ENC_HMAC_SHA1_96_AES128;
+-#endif
+-#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
+-	etype_list |= ENC_HMAC_SHA1_96_AES256;
+-#endif
+-
+-	etype_list_str = talloc_asprintf(mem_ctx, "%d", etype_list);
+-	if (!etype_list_str) {
+-		return ADS_ERROR(LDAP_NO_MEMORY);
+-	}
+-
+-	/* Find our DN */
+-
+-	status = libnet_join_find_machine_acct(mem_ctx, r);
+-	if (!ADS_ERR_OK(status)) {
+-		return status;
+-	}
+-
+-	/* now do the mods */
+-
+-	mods = ads_init_mods(mem_ctx);
+-	if (!mods) {
+-		return ADS_ERROR(LDAP_NO_MEMORY);
+-	}
+-
+-	status = ads_mod_str(mem_ctx, &mods, "msDS-SupportedEncryptionTypes",
+-			     etype_list_str);
+-	if (!ADS_ERR_OK(status)) {
+-		return status;
+-	}
+-
+-	return ads_gen_mod(r->in.ads, r->out.dn, mods);
+-}
+-
+-/****************************************************************
+-****************************************************************/
+-
+ static bool libnet_join_create_keytab(TALLOC_CTX *mem_ctx,
+ 				      struct libnet_JoinCtx *r)
+ {
+@@ -725,7 +679,6 @@ static ADS_STATUS libnet_join_post_processing_ads(TALLOC_CTX *mem_ctx,
+ 						  struct libnet_JoinCtx *r)
+ {
+ 	ADS_STATUS status;
+-	uint32_t func_level = 0;
+ 
+ 	if (!r->in.ads) {
+ 		status = libnet_join_connect_ads(mem_ctx, r);
+@@ -760,24 +713,6 @@ static ADS_STATUS libnet_join_post_processing_ads(TALLOC_CTX *mem_ctx,
+ 		return status;
+ 	}
+ 
+-	status = ads_domain_func_level(r->in.ads, &func_level);
+-	if (!ADS_ERR_OK(status)) {
+-		libnet_join_set_error_string(mem_ctx, r,
+-			"failed to query domain controller functional level: %s",
+-			ads_errstr(status));
+-		return status;
+-	}
+-
+-	if (func_level >= DS_DOMAIN_FUNCTION_2008) {
+-		status = libnet_join_set_etypes(mem_ctx, r);
+-		if (!ADS_ERR_OK(status)) {
+-			libnet_join_set_error_string(mem_ctx, r,
+-				"failed to set machine kerberos encryption types: %s",
+-				ads_errstr(status));
+-			return status;
+-		}
+-	}
+-
+ 	if (!libnet_join_derive_salting_principal(mem_ctx, r)) {
+ 		return ADS_ERROR_NT(NT_STATUS_UNSUCCESSFUL);
+ 	}
+-- 
+2.9.0
+
+
+From 3b269e29a5b91723749d16685782c5c590fda424 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 11 Mar 2016 23:14:13 +0100
+Subject: [PATCH 02/11] Partly revert "s3:libads: setup the
+ msDS-SupportedEncryptionTypes attribute on ldap_add"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This partly reverts commit 0c74d62524db376b6a3fac00c688be0cdffcaa80.
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Günther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit 6686f67d2a91146c8bb2fb2a8104fcaa5710b855)
+---
+ source3/libnet/libnet_join.c | 46 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/source3/libnet/libnet_join.c b/source3/libnet/libnet_join.c
+index 5564bd2..343e5f1 100644
+--- a/source3/libnet/libnet_join.c
++++ b/source3/libnet/libnet_join.c
+@@ -604,6 +604,52 @@ static ADS_STATUS libnet_join_set_os_attributes(TALLOC_CTX *mem_ctx,
+ 
+ /****************************************************************
+ ****************************************************************/
++#if 0
++static ADS_STATUS libnet_join_set_etypes(TALLOC_CTX *mem_ctx,
++					 struct libnet_JoinCtx *r)
++{
++	ADS_STATUS status;
++	ADS_MODLIST mods;
++	uint32_t etype_list = ENC_CRC32 | ENC_RSA_MD5 | ENC_RC4_HMAC_MD5;
++	const char *etype_list_str;
++
++#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
++	etype_list |= ENC_HMAC_SHA1_96_AES128;
++#endif
++#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
++	etype_list |= ENC_HMAC_SHA1_96_AES256;
++#endif
++
++	etype_list_str = talloc_asprintf(mem_ctx, "%d", etype_list);
++	if (!etype_list_str) {
++		return ADS_ERROR(LDAP_NO_MEMORY);
++	}
++
++	/* Find our DN */
++
++	status = libnet_join_find_machine_acct(mem_ctx, r);
++	if (!ADS_ERR_OK(status)) {
++		return status;
++	}
++
++	/* now do the mods */
++
++	mods = ads_init_mods(mem_ctx);
++	if (!mods) {
++		return ADS_ERROR(LDAP_NO_MEMORY);
++	}
++
++	status = ads_mod_str(mem_ctx, &mods, "msDS-SupportedEncryptionTypes",
++			     etype_list_str);
++	if (!ADS_ERR_OK(status)) {
++		return status;
++	}
++
++	return ads_gen_mod(r->in.ads, r->out.dn, mods);
++}
++#endif
++/****************************************************************
++****************************************************************/
+ 
+ static bool libnet_join_create_keytab(TALLOC_CTX *mem_ctx,
+ 				      struct libnet_JoinCtx *r)
+-- 
+2.9.0
+
+
+From 452f99fdd08f9c5e5dcc660dc8900115f0abb093 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Wed, 2 Mar 2016 18:07:53 +0100
+Subject: [PATCH 03/11] s3:libnet:libnet_join: prepare to allow connecting with
+ machine creds.
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Guenther
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit 71d5634ab58f0ca21db633990231bd01a22c956c)
+---
+ source3/libnet/libnet_join.c | 73 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/source3/libnet/libnet_join.c b/source3/libnet/libnet_join.c
+index 343e5f1..cc93a85 100644
+--- a/source3/libnet/libnet_join.c
++++ b/source3/libnet/libnet_join.c
+@@ -42,6 +42,7 @@
+ #include "lib/param/loadparm.h"
+ #include "libcli/auth/netlogon_creds_cli.h"
+ #include "auth/credentials/credentials.h"
++#include "krb5_env.h"
+ 
+ /****************************************************************
+ ****************************************************************/
+@@ -118,6 +119,7 @@ static ADS_STATUS libnet_connect_ads(const char *dns_domain_name,
+ 				     const char *dc_name,
+ 				     const char *user_name,
+ 				     const char *password,
++				     const char *ccname,
+ 				     ADS_STRUCT **ads)
+ {
+ 	ADS_STATUS status;
+@@ -150,6 +152,12 @@ static ADS_STATUS libnet_connect_ads(const char *dns_domain_name,
+ 		my_ads->auth.password = SMB_STRDUP(password);
+ 	}
+ 
++	if (ccname != NULL) {
++		SAFE_FREE(my_ads->auth.ccache_name);
++		my_ads->auth.ccache_name = SMB_STRDUP(ccname);
++		setenv(KRB5_ENV_CCNAME, my_ads->auth.ccache_name, 1);
++	}
++
+ 	status = ads_connect_user_creds(my_ads);
+ 	if (!ADS_ERR_OK(status)) {
+ 		ads_destroy(&my_ads);
+@@ -164,15 +172,51 @@ static ADS_STATUS libnet_connect_ads(const char *dns_domain_name,
+ ****************************************************************/
+ 
+ static ADS_STATUS libnet_join_connect_ads(TALLOC_CTX *mem_ctx,
+-					  struct libnet_JoinCtx *r)
++					  struct libnet_JoinCtx *r,
++					  bool use_machine_creds)
+ {
+ 	ADS_STATUS status;
++	const char *username;
++	const char *password;
++	const char *ccname = NULL;
++
++	if (use_machine_creds) {
++		if (r->in.machine_name == NULL ||
++		    r->in.machine_password == NULL) {
++			return ADS_ERROR_NT(NT_STATUS_INVALID_PARAMETER);
++		}
++		username = talloc_strdup(mem_ctx, r->in.machine_name);
++		if (username == NULL) {
++			return ADS_ERROR(LDAP_NO_MEMORY);
++		}
++		if (username[strlen(username)] != '$') {
++			username = talloc_asprintf(username, "%s$", username);
++			if (username == NULL) {
++				return ADS_ERROR(LDAP_NO_MEMORY);
++			}
++		}
++		password = r->in.machine_password;
++		ccname = "MEMORY:libnet_join_machine_creds";
++	} else {
++		username = r->in.admin_account;
++		password = r->in.admin_password;
++
++		/*
++		 * when r->in.use_kerberos is set to allow "net ads join -k" we
++		 * may not override the provided credential cache - gd
++		 */
++
++		if (!r->in.use_kerberos) {
++			ccname = "MEMORY:libnet_join_user_creds";
++		}
++	}
+ 
+ 	status = libnet_connect_ads(r->out.dns_domain_name,
+ 				    r->out.netbios_domain_name,
+ 				    r->in.dc_name,
+-				    r->in.admin_account,
+-				    r->in.admin_password,
++				    username,
++				    password,
++				    ccname,
+ 				    &r->in.ads);
+ 	if (!ADS_ERR_OK(status)) {
+ 		libnet_join_set_error_string(mem_ctx, r,
+@@ -201,6 +245,24 @@ static ADS_STATUS libnet_join_connect_ads(TALLOC_CTX *mem_ctx,
+ /****************************************************************
+ ****************************************************************/
+ 
++static ADS_STATUS libnet_join_connect_ads_user(TALLOC_CTX *mem_ctx,
++					       struct libnet_JoinCtx *r)
++{
++	return libnet_join_connect_ads(mem_ctx, r, false);
++}
++
++/****************************************************************
++****************************************************************/
++#if 0
++static ADS_STATUS libnet_join_connect_ads_machine(TALLOC_CTX *mem_ctx,
++						  struct libnet_JoinCtx *r)
++{
++	return libnet_join_connect_ads(mem_ctx, r, true);
++}
++#endif
++/****************************************************************
++****************************************************************/
++
+ static ADS_STATUS libnet_unjoin_connect_ads(TALLOC_CTX *mem_ctx,
+ 					    struct libnet_UnjoinCtx *r)
+ {
+@@ -211,6 +273,7 @@ static ADS_STATUS libnet_unjoin_connect_ads(TALLOC_CTX *mem_ctx,
+ 				    r->in.dc_name,
+ 				    r->in.admin_account,
+ 				    r->in.admin_password,
++				    NULL,
+ 				    &r->in.ads);
+ 	if (!ADS_ERR_OK(status)) {
+ 		libnet_unjoin_set_error_string(mem_ctx, r,
+@@ -727,7 +790,7 @@ static ADS_STATUS libnet_join_post_processing_ads(TALLOC_CTX *mem_ctx,
+ 	ADS_STATUS status;
+ 
+ 	if (!r->in.ads) {
+-		status = libnet_join_connect_ads(mem_ctx, r);
++		status = libnet_join_connect_ads_user(mem_ctx, r);
+ 		if (!ADS_ERR_OK(status)) {
+ 			return status;
+ 		}
+@@ -2258,7 +2321,7 @@ static WERROR libnet_DomainJoin(TALLOC_CTX *mem_ctx,
+ 	if (r->out.domain_is_ad && r->in.account_ou &&
+ 	    !(r->in.join_flags & WKSSVC_JOIN_FLAGS_JOIN_UNSECURE)) {
+ 
+-		ads_status = libnet_join_connect_ads(mem_ctx, r);
++		ads_status = libnet_join_connect_ads_user(mem_ctx, r);
+ 		if (!ADS_ERR_OK(ads_status)) {
+ 			return WERR_DEFAULT_JOIN_REQUIRED;
+ 		}
+-- 
+2.9.0
+
+
+From 3f6d9131abd68620bb35ef3bafbde586a1b751c2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 4 Mar 2016 17:42:05 +0100
+Subject: [PATCH 04/11] s3:libads:ldap: print LDAP error message with log level
+ 10.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit 34030b025b9e4cd5e7321d6e242f6c03da2a60c0)
+---
+ source3/libads/ldap.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/source3/libads/ldap.c b/source3/libads/ldap.c
+index 125c9d7..91753d2 100644
+--- a/source3/libads/ldap.c
++++ b/source3/libads/ldap.c
+@@ -1416,6 +1416,17 @@ static ADS_STATUS ads_mod_ber(TALLOC_CTX *ctx, ADS_MODLIST *mods,
+ }
+ #endif
+ 
++static void ads_print_error(int ret, LDAP *ld)
++{
++	if (ret != 0) {
++		char *ld_error = NULL;
++		ldap_get_option(ld, LDAP_OPT_ERROR_STRING, &ld_error);
++		DEBUG(10,("AD LDAP failure %d (%s):\n%s\n", ret,
++			ldap_err2string(ret), ld_error));
++		SAFE_FREE(ld_error);
++	}
++}
++
+ /**
+  * Perform an ldap modify
+  * @param ads connection to ads server
+@@ -1451,6 +1462,7 @@ ADS_STATUS ads_gen_mod(ADS_STRUCT *ads, const char *mod_dn, ADS_MODLIST mods)
+ 	mods[i] = NULL;
+ 	ret = ldap_modify_ext_s(ads->ldap.ld, utf8_dn,
+ 				(LDAPMod **) mods, controls, NULL);
++	ads_print_error(ret, ads->ldap.ld);
+ 	TALLOC_FREE(utf8_dn);
+ 	return ADS_ERROR(ret);
+ }
+@@ -1479,6 +1491,7 @@ ADS_STATUS ads_gen_add(ADS_STRUCT *ads, const char *new_dn, ADS_MODLIST mods)
+ 	mods[i] = NULL;
+ 
+ 	ret = ldap_add_s(ads->ldap.ld, utf8_dn, (LDAPMod**)mods);
++	ads_print_error(ret, ads->ldap.ld);
+ 	TALLOC_FREE(utf8_dn);
+ 	return ADS_ERROR(ret);
+ }
+@@ -1500,6 +1513,7 @@ ADS_STATUS ads_del_dn(ADS_STRUCT *ads, char *del_dn)
+ 	}
+ 
+ 	ret = ldap_delete_s(ads->ldap.ld, utf8_dn);
++	ads_print_error(ret, ads->ldap.ld);
+ 	TALLOC_FREE(utf8_dn);
+ 	return ADS_ERROR(ret);
+ }
+-- 
+2.9.0
+
+
+From 6a2647247ab0abddc38c2abade36116e3a2e5788 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 11 Mar 2016 12:13:24 +0100
+Subject: [PATCH 05/11] s3:libads:ndr: add ADS_AUTH_USER_CREDS to
+ ndr_print_ads_auth_flags()
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit e8f6acdeece990dc8953d494113dee856d80da45)
+---
+ source3/libads/ndr.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/source3/libads/ndr.c b/source3/libads/ndr.c
+index fd0b63e..ac0b9e6 100644
+--- a/source3/libads/ndr.c
++++ b/source3/libads/ndr.c
+@@ -37,6 +37,7 @@ static void ndr_print_ads_auth_flags(struct ndr_print *ndr, const char *name, ui
+ 	ndr_print_bitmap_flag(ndr, sizeof(uint32_t), "ADS_AUTH_SASL_SIGN", ADS_AUTH_SASL_SIGN, r);
+ 	ndr_print_bitmap_flag(ndr, sizeof(uint32_t), "ADS_AUTH_SASL_SEAL", ADS_AUTH_SASL_SEAL, r);
+ 	ndr_print_bitmap_flag(ndr, sizeof(uint32_t), "ADS_AUTH_SASL_FORCE", ADS_AUTH_SASL_FORCE, r);
++	ndr_print_bitmap_flag(ndr, sizeof(uint32_t), "ADS_AUTH_USER_CREDS", ADS_AUTH_USER_CREDS, r);
+ 	ndr->depth--;
+ }
+ 
+-- 
+2.9.0
+
+
+From 51657c35d3455226f697bef24a7d967944a2c67d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 11 Mar 2016 12:15:14 +0100
+Subject: [PATCH 06/11] s3:libads:ldap: fix ads_check_ou_dn to deal with
+ account_ou not being initialized
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit c61b111e6fa3e138d4d9cf5038b69644248e834a)
+---
+ source3/libads/ldap.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/source3/libads/ldap.c b/source3/libads/ldap.c
+index 91753d2..8eac5c8 100644
+--- a/source3/libads/ldap.c
++++ b/source3/libads/ldap.c
+@@ -3870,10 +3870,16 @@ ADS_STATUS ads_check_ou_dn(TALLOC_CTX *mem_ctx,
+ 	const char *name;
+ 	char *ou_string;
+ 
+-	exploded_dn = ldap_explode_dn(*account_ou, 0);
+-	if (exploded_dn) {
+-		ldap_value_free(exploded_dn);
+-		return ADS_SUCCESS;
++	if (account_ou == NULL) {
++		return ADS_ERROR_NT(NT_STATUS_INVALID_PARAMETER);
++	}
++
++	if (*account_ou != NULL) {
++		exploded_dn = ldap_explode_dn(*account_ou, 0);
++		if (exploded_dn) {
++			ldap_value_free(exploded_dn);
++			return ADS_SUCCESS;
++		}
+ 	}
+ 
+ 	ou_string = ads_ou_string(ads, *account_ou);
+-- 
+2.9.0
+
+
+From 7a1303f27904fafb8245b9ad9a26e7f846d9968d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Thu, 10 Mar 2016 18:03:47 +0100
+Subject: [PATCH 07/11] s3:libnet:libnet_join: always try to create
+ machineaccount via LDAP first.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit df8f79cc9d44ad7b2caa6b86b7ebde7bb1fd4c8c)
+---
+ source3/libnet/libnet_join.c | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/source3/libnet/libnet_join.c b/source3/libnet/libnet_join.c
+index cc93a85..b10080d 100644
+--- a/source3/libnet/libnet_join.c
++++ b/source3/libnet/libnet_join.c
+@@ -2318,16 +2318,36 @@ static WERROR libnet_DomainJoin(TALLOC_CTX *mem_ctx,
+ 		r->out.dns_domain_name, r->out.netbios_domain_name,
+ 		NULL, smbXcli_conn_remote_sockaddr(cli->conn));
+ 
+-	if (r->out.domain_is_ad && r->in.account_ou &&
++	if (r->out.domain_is_ad &&
+ 	    !(r->in.join_flags & WKSSVC_JOIN_FLAGS_JOIN_UNSECURE)) {
+ 
++		const char *initial_account_ou = r->in.account_ou;
++
++		/*
++		 * we want to create the msDS-SupportedEncryptionTypes attribute
++		 * as early as possible so always try an LDAP create as the user
++		 * first. We copy r->in.account_ou because it may be changed
++		 * during the machine pre-creation.
++		 */
++
+ 		ads_status = libnet_join_connect_ads_user(mem_ctx, r);
+ 		if (!ADS_ERR_OK(ads_status)) {
+ 			return WERR_DEFAULT_JOIN_REQUIRED;
+ 		}
+ 
+ 		ads_status = libnet_join_precreate_machine_acct(mem_ctx, r);
+-		if (!ADS_ERR_OK(ads_status)) {
++		if (ADS_ERR_OK(ads_status)) {
++
++			/*
++			 * LDAP object create succeeded, now go to the rpc
++			 * password set routines
++			 */
++
++			r->in.join_flags &= ~WKSSVC_JOIN_FLAGS_ACCOUNT_CREATE;
++			goto rpc_join;
++		}
++
++		if (initial_account_ou != NULL) {
+ 			libnet_join_set_error_string(mem_ctx, r,
+ 				"failed to precreate account in ou %s: %s",
+ 				r->in.account_ou,
+@@ -2335,10 +2355,12 @@ static WERROR libnet_DomainJoin(TALLOC_CTX *mem_ctx,
+ 			return WERR_DEFAULT_JOIN_REQUIRED;
+ 		}
+ 
+-		r->in.join_flags &= ~WKSSVC_JOIN_FLAGS_ACCOUNT_CREATE;
++		DEBUG(5, ("failed to precreate account in ou %s: %s",
++			r->in.account_ou, ads_errstr(ads_status)));
+ 	}
+ #endif /* HAVE_ADS */
+ 
++ rpc_join:
+ 	if ((r->in.join_flags & WKSSVC_JOIN_FLAGS_JOIN_UNSECURE) &&
+ 	    (r->in.join_flags & WKSSVC_JOIN_FLAGS_MACHINE_PWD_PASSED)) {
+ 		status = libnet_join_joindomain_rpc_unsecure(mem_ctx, r, cli);
+-- 
+2.9.0
+
+
+From d4cf8358ce96964443cae441f0808d744a1fd95d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 11 Mar 2016 16:02:27 +0100
+Subject: [PATCH 08/11] s3:librpc:idl:libnet_join: add encryption types to
+ libnet_JoinCtx.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit 4a49f6fac9d6c77d1eedf914308e67eb6e2baa8d)
+---
+ source3/librpc/idl/libnet_join.idl | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/source3/librpc/idl/libnet_join.idl b/source3/librpc/idl/libnet_join.idl
+index ac0a350..0718739 100644
+--- a/source3/librpc/idl/libnet_join.idl
++++ b/source3/librpc/idl/libnet_join.idl
+@@ -35,6 +35,7 @@ interface libnetjoin
+ 		[in] boolean8 use_kerberos,
+ 		[in] netr_SchannelType secure_channel_type,
+ 		[in,noprint] messaging_context *msg_ctx,
++		[in] uint32 desired_encryption_types,
+ 		[out] string account_name,
+ 		[out] string netbios_domain_name,
+ 		[out] string dns_domain_name,
+@@ -43,7 +44,8 @@ interface libnetjoin
+ 		[out] dom_sid *domain_sid,
+ 		[out] boolean8 modified_config,
+ 		[out] string error_string,
+-		[out] boolean8 domain_is_ad
++		[out] boolean8 domain_is_ad,
++		[out] uint32 set_encryption_types
+ 		);
+ 
+ 	[nopush,nopull,noopnum] WERROR libnet_UnjoinCtx(
+-- 
+2.9.0
+
+
+From b6dae5b223f379dbdbd3b4ccca9492753f7f5286 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 11 Mar 2016 16:04:52 +0100
+Subject: [PATCH 09/11] s3:libnet:libnet_join: define list of desired
+ encryption types only once.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit e0da059b39f9dd5ccb74f32f965e1ced384c77eb)
+---
+ source3/libads/ads_proto.h   |  6 ++++--
+ source3/libads/ldap.c        | 14 ++++----------
+ source3/libnet/libnet_join.c | 24 ++++++++++++++----------
+ 3 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/source3/libads/ads_proto.h b/source3/libads/ads_proto.h
+index 1399f41..425c352 100644
+--- a/source3/libads/ads_proto.h
++++ b/source3/libads/ads_proto.h
+@@ -97,8 +97,10 @@ ADS_STATUS ads_get_service_principal_names(TALLOC_CTX *mem_ctx,
+ ADS_STATUS ads_clear_service_principal_names(ADS_STRUCT *ads, const char *machine_name);
+ ADS_STATUS ads_add_service_principal_name(ADS_STRUCT *ads, const char *machine_name,
+                                           const char *my_fqdn, const char *spn);
+-ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads, const char *machine_name,
+-                                   const char *org_unit);
++ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads,
++				   const char *machine_name,
++				   const char *org_unit,
++				   uint32_t etype_list);
+ ADS_STATUS ads_move_machine_acct(ADS_STRUCT *ads, const char *machine_name,
+                                  const char *org_unit, bool *moved);
+ int ads_count_replies(ADS_STRUCT *ads, void *res);
+diff --git a/source3/libads/ldap.c b/source3/libads/ldap.c
+index 8eac5c8..72bf4d9 100644
+--- a/source3/libads/ldap.c
++++ b/source3/libads/ldap.c
+@@ -2006,8 +2006,10 @@ ADS_STATUS ads_add_service_principal_name(ADS_STRUCT *ads, const char *machine_n
+  * @return 0 upon success, or non-zero otherwise
+ **/
+ 
+-ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads, const char *machine_name, 
+-                                   const char *org_unit)
++ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads,
++				   const char *machine_name,
++				   const char *org_unit,
++				   uint32_t etype_list)
+ {
+ 	ADS_STATUS ret;
+ 	char *samAccountName, *controlstr;
+@@ -2063,16 +2065,8 @@ ADS_STATUS ads_create_machine_acct(ADS_STRUCT *ads, const char *machine_name,
+ 	ads_mod_str(ctx, &mods, "userAccountControl", controlstr);
+ 
+ 	if (func_level >= DS_DOMAIN_FUNCTION_2008) {
+-		uint32_t etype_list = ENC_CRC32 | ENC_RSA_MD5 | ENC_RC4_HMAC_MD5;
+ 		const char *etype_list_str;
+ 
+-#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
+-		etype_list |= ENC_HMAC_SHA1_96_AES128;
+-#endif
+-#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
+-		etype_list |= ENC_HMAC_SHA1_96_AES256;
+-#endif
+-
+ 		etype_list_str = talloc_asprintf(ctx, "%d", (int)etype_list);
+ 		if (etype_list_str == NULL) {
+ 			goto done;
+diff --git a/source3/libnet/libnet_join.c b/source3/libnet/libnet_join.c
+index b10080d..876a453 100644
+--- a/source3/libnet/libnet_join.c
++++ b/source3/libnet/libnet_join.c
+@@ -318,7 +318,8 @@ static ADS_STATUS libnet_join_precreate_machine_acct(TALLOC_CTX *mem_ctx,
+ 
+ 	status = ads_create_machine_acct(r->in.ads,
+ 					 r->in.machine_name,
+-					 r->in.account_ou);
++					 r->in.account_ou,
++					 r->in.desired_encryption_types);
+ 
+ 	if (ADS_ERR_OK(status)) {
+ 		DEBUG(1,("machine account creation created\n"));
+@@ -673,17 +674,10 @@ static ADS_STATUS libnet_join_set_etypes(TALLOC_CTX *mem_ctx,
+ {
+ 	ADS_STATUS status;
+ 	ADS_MODLIST mods;
+-	uint32_t etype_list = ENC_CRC32 | ENC_RSA_MD5 | ENC_RC4_HMAC_MD5;
+ 	const char *etype_list_str;
+ 
+-#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
+-	etype_list |= ENC_HMAC_SHA1_96_AES128;
+-#endif
+-#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
+-	etype_list |= ENC_HMAC_SHA1_96_AES256;
+-#endif
+-
+-	etype_list_str = talloc_asprintf(mem_ctx, "%d", etype_list);
++	etype_list_str = talloc_asprintf(mem_ctx, "%d",
++					 r->in.desired_encryption_types);
+ 	if (!etype_list_str) {
+ 		return ADS_ERROR(LDAP_NO_MEMORY);
+ 	}
+@@ -2143,6 +2137,16 @@ WERROR libnet_init_JoinCtx(TALLOC_CTX *mem_ctx,
+ 
+ 	ctx->in.secure_channel_type = SEC_CHAN_WKSTA;
+ 
++	ctx->in.desired_encryption_types = ENC_CRC32 |
++					   ENC_RSA_MD5 |
++					   ENC_RC4_HMAC_MD5;
++#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
++	ctx->in.desired_encryption_types |= ENC_HMAC_SHA1_96_AES128;
++#endif
++#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
++	ctx->in.desired_encryption_types |= ENC_HMAC_SHA1_96_AES256;
++#endif
++
+ 	*r = ctx;
+ 
+ 	return WERR_OK;
+-- 
+2.9.0
+
+
+From 51a68159e119149b9527cac8a8a119f34bb6879a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 11 Mar 2016 16:05:53 +0100
+Subject: [PATCH 10/11] s3:libnet:libnet_join: fill in output enctypes and only
+ modify when necessary.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+(cherry picked from commit 5d498d1b4d9b83f179fb7b2841a19ad984eec5f8)
+---
+ source3/libads/ldap.c        |  2 +-
+ source3/libnet/libnet_join.c | 18 +++++++++++++++++-
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/source3/libads/ldap.c b/source3/libads/ldap.c
+index 72bf4d9..f611da2 100644
+--- a/source3/libads/ldap.c
++++ b/source3/libads/ldap.c
+@@ -1268,7 +1268,7 @@ char *ads_parent_dn(const char *dn)
+ {
+ 	ADS_STATUS status;
+ 	char *expr;
+-	const char *attrs[] = {"*", "nTSecurityDescriptor", NULL};
++	const char *attrs[] = {"*", "msDS-SupportedEncryptionTypes", "nTSecurityDescriptor", NULL};
+ 
+ 	*res = NULL;
+ 
+diff --git a/source3/libnet/libnet_join.c b/source3/libnet/libnet_join.c
+index 876a453..9f3d830 100644
+--- a/source3/libnet/libnet_join.c
++++ b/source3/libnet/libnet_join.c
+@@ -417,6 +417,11 @@ static ADS_STATUS libnet_join_find_machine_acct(TALLOC_CTX *mem_ctx,
+ 		goto done;
+ 	}
+ 
++	if (!ads_pull_uint32(r->in.ads, res, "msDS-SupportedEncryptionTypes",
++			     &r->out.set_encryption_types)) {
++		r->out.set_encryption_types = 0;
++	}
++
+  done:
+ 	ads_msgfree(r->in.ads, res);
+ 	TALLOC_FREE(dn);
+@@ -689,6 +694,10 @@ static ADS_STATUS libnet_join_set_etypes(TALLOC_CTX *mem_ctx,
+ 		return status;
+ 	}
+ 
++	if (r->in.desired_encryption_types == r->out.set_encryption_types) {
++		return ADS_SUCCESS;
++	}
++
+ 	/* now do the mods */
+ 
+ 	mods = ads_init_mods(mem_ctx);
+@@ -702,7 +711,14 @@ static ADS_STATUS libnet_join_set_etypes(TALLOC_CTX *mem_ctx,
+ 		return status;
+ 	}
+ 
+-	return ads_gen_mod(r->in.ads, r->out.dn, mods);
++	status = ads_gen_mod(r->in.ads, r->out.dn, mods);
++	if (!ADS_ERR_OK(status)) {
++		return status;
++	}
++
++	r->out.set_encryption_types = r->in.desired_encryption_types;
++
++	return ADS_SUCCESS;
+ }
+ #endif
+ /****************************************************************
+-- 
+2.9.0
+
+
+From a489ac90045212decebbadf46a51fff42c224d3c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Fri, 11 Mar 2016 23:15:06 +0100
+Subject: [PATCH 11/11] s3:libnet:libnet_join: update
+ msDS-SupportedEncryptionTypes (if required) with machine creds.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11755
+
+Pair-Programmed-With: Stefan Metzmacher <metze@samba.org>
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Signed-off-by: Stefan Metzmacher <metze@samba.org>
+
+Autobuild-User(master): Stefan Metzmacher <metze@samba.org>
+Autobuild-Date(master): Mon Mar 14 19:38:48 CET 2016 on sn-devel-144
+
+(cherry picked from commit 06aefe4b956ae8748e20ae4c730aa344e81808b6)
+---
+ source3/libnet/libnet_join.c | 59 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/source3/libnet/libnet_join.c b/source3/libnet/libnet_join.c
+index 9f3d830..84f0e40 100644
+--- a/source3/libnet/libnet_join.c
++++ b/source3/libnet/libnet_join.c
+@@ -253,13 +253,13 @@ static ADS_STATUS libnet_join_connect_ads_user(TALLOC_CTX *mem_ctx,
+ 
+ /****************************************************************
+ ****************************************************************/
+-#if 0
++
+ static ADS_STATUS libnet_join_connect_ads_machine(TALLOC_CTX *mem_ctx,
+ 						  struct libnet_JoinCtx *r)
+ {
+ 	return libnet_join_connect_ads(mem_ctx, r, true);
+ }
+-#endif
++
+ /****************************************************************
+ ****************************************************************/
+ 
+@@ -673,7 +673,7 @@ static ADS_STATUS libnet_join_set_os_attributes(TALLOC_CTX *mem_ctx,
+ 
+ /****************************************************************
+ ****************************************************************/
+-#if 0
++
+ static ADS_STATUS libnet_join_set_etypes(TALLOC_CTX *mem_ctx,
+ 					 struct libnet_JoinCtx *r)
+ {
+@@ -720,7 +720,7 @@ static ADS_STATUS libnet_join_set_etypes(TALLOC_CTX *mem_ctx,
+ 
+ 	return ADS_SUCCESS;
+ }
+-#endif
++
+ /****************************************************************
+ ****************************************************************/
+ 
+@@ -798,6 +798,7 @@ static ADS_STATUS libnet_join_post_processing_ads(TALLOC_CTX *mem_ctx,
+ 						  struct libnet_JoinCtx *r)
+ {
+ 	ADS_STATUS status;
++	bool need_etype_update = false;
+ 
+ 	if (!r->in.ads) {
+ 		status = libnet_join_connect_ads_user(mem_ctx, r);
+@@ -832,6 +833,56 @@ static ADS_STATUS libnet_join_post_processing_ads(TALLOC_CTX *mem_ctx,
+ 		return status;
+ 	}
+ 
++	status = libnet_join_find_machine_acct(mem_ctx, r);
++	if (!ADS_ERR_OK(status)) {
++		return status;
++	}
++
++	if (r->in.desired_encryption_types != r->out.set_encryption_types) {
++		uint32_t func_level = 0;
++
++		status = ads_domain_func_level(r->in.ads, &func_level);
++		if (!ADS_ERR_OK(status)) {
++			libnet_join_set_error_string(mem_ctx, r,
++				"failed to query domain controller functional level: %s",
++				ads_errstr(status));
++			return status;
++		}
++
++		if (func_level >= DS_DOMAIN_FUNCTION_2008) {
++			need_etype_update = true;
++		}
++	}
++
++	if (need_etype_update) {
++		/*
++		 * We need to reconnect as machine account in order
++		 * to update msDS-SupportedEncryptionTypes reliable
++		 */
++
++		if (r->in.ads->auth.ccache_name != NULL) {
++			ads_kdestroy(r->in.ads->auth.ccache_name);
++		}
++
++		ads_destroy(&r->in.ads);
++
++		status = libnet_join_connect_ads_machine(mem_ctx, r);
++		if (!ADS_ERR_OK(status)) {
++			libnet_join_set_error_string(mem_ctx, r,
++				"Failed to connect as machine account: %s",
++				ads_errstr(status));
++			return status;
++		}
++
++		status = libnet_join_set_etypes(mem_ctx, r);
++		if (!ADS_ERR_OK(status)) {
++			libnet_join_set_error_string(mem_ctx, r,
++				"failed to set machine kerberos encryption types: %s",
++				ads_errstr(status));
++			return status;
++		}
++	}
++
+ 	if (!libnet_join_derive_salting_principal(mem_ctx, r)) {
+ 		return ADS_ERROR_NT(NT_STATUS_UNSUCCESSFUL);
+ 	}
+-- 
+2.9.0
+

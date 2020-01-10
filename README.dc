@@ -1,0 +1,19 @@
+MIT Kerberos 5 Support
+=======================
+
+Fedora and Red Hat Enterprise Linux are using MIT Kerberos implementation as
+its Kerberos infrastructure of choice.  Samba 4 build in Fedora is using MIT
+Kerberos implementation in order to allow system-wide interoperability between
+both desktop and server applications running on the same machine.
+
+At the moment Samba 4 Active Directory Domain Controller implementation is not
+available with MIT Kereberos. The Samba Team members are currently working on
+Samba 4 MIT Kerberos support as this is a requirement for a GNU/Linux
+distribution integration of Samba 4 AD DC features.
+
+We have just finished migrating the file server and all client utilities to MIT
+Kerberos. The result of this work is available as unified samba-* packages in
+Fedora and as samba4-* packages in Red Hat Enterprise Linux 6.
+
+In case of further questions do not hesitate to send your inquiries to
+samba4-owner@fedoraproject.org

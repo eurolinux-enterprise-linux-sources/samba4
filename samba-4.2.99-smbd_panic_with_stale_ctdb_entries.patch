@@ -1,0 +1,27 @@
+From 5316ddc181abb380d6b5a171633f154aed354452 Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Wed, 20 Apr 2016 13:13:38 +0200
+Subject: [PATCH] smbd: Fix an assert
+
+This might stumble over stale entries
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+---
+ source3/smbd/oplock.c |    1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/source3/smbd/oplock.c b/source3/smbd/oplock.c
+index f50d3b9..9996b8b 100644
+--- a/source3/smbd/oplock.c
++++ b/source3/smbd/oplock.c
+@@ -190,6 +190,7 @@ bool update_num_read_oplocks(files_struct *fsp, struct share_mode_lock *lck)
+ 		/*
+ 		 * If we're the only one, we don't need a brlock entry
+ 		 */
++		remove_stale_share_mode_entries(d);
+ 		SMB_ASSERT(d->num_share_modes == 1);
+ 		SMB_ASSERT(EXCLUSIVE_OPLOCK_TYPE(d->share_modes[0].op_type));
+ 		return true;
+-- 
+1.7.9.5
+

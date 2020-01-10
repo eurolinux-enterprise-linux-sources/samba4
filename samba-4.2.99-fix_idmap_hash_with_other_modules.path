@@ -1,0 +1,1130 @@
+From 8672b486a2c847361e0e157be19eb2143ac550ab Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Tue, 18 Aug 2015 13:18:33 +0200
+Subject: [PATCH 01/14] loadparm3: Add lp_wi_scan_global_parametrics()
+
+This routine takes a regex and goes through all parametric parameters
+in [global], matching the regex. It can easily be extended to also
+look at shares, but right now it will only be used to list all idmap
+config domain names.
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+Bug: https://bugzilla.samba.org/show_bug.cgi?id=11464
+(cherry picked from commit 443dd9bbbc641ede10a2a3708465f61ea3dfbde3)
+---
+ source3/include/proto.h  |  9 ++++++
+ source3/param/loadparm.c | 73 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 82 insertions(+)
+
+diff --git a/source3/include/proto.h b/source3/include/proto.h
+index be90024..df7eecc 100644
+--- a/source3/include/proto.h
++++ b/source3/include/proto.h
+@@ -23,6 +23,9 @@
+ #ifndef _PROTO_H_
+ #define _PROTO_H_
+ 
++#include <sys/types.h>
++#include <regex.h>
++
+ /* The following definitions come from lib/access.c  */
+ 
+ bool client_match(const char *tok, const void *item);
+@@ -951,6 +954,12 @@ int lp_smb2_max_credits(void);
+ int lp_cups_encrypt(void);
+ bool lp_widelinks(int );
+ 
++int lp_wi_scan_global_parametrics(
++	const char *regex, size_t max_matches,
++	bool (*cb)(const char *string, regmatch_t matches[],
++		   void *private_data),
++	void *private_data);
++
+ char *lp_parm_talloc_string(TALLOC_CTX *ctx, int snum, const char *type, const char *option, const char *def);
+ const char *lp_parm_const_string(int snum, const char *type, const char *option, const char *def);
+ struct loadparm_service;
+diff --git a/source3/param/loadparm.c b/source3/param/loadparm.c
+index e805fa4..9e56aca 100644
+--- a/source3/param/loadparm.c
++++ b/source3/param/loadparm.c
+@@ -1074,6 +1074,79 @@ static struct parmlist_entry *get_parametrics(int snum, const char *type,
+ 	}
+ }
+ 
++static void discard_whitespace(char *str)
++{
++	size_t len = strlen(str);
++	size_t i = 0;
++
++	while (i < len) {
++		if (isspace(str[i])) {
++			memmove(&str[i], &str[i+1], len-i);
++			len -= 1;
++			continue;
++		}
++		i += 1;
++	}
++}
++
++/**
++ * @brief Go through all global parametric parameters
++ *
++ * @param regex_str	A regular expression to scan param for
++ * @param max_matches   Max number of submatches the regexp expects
++ * @param cb		Function to call on match. Should return true
++ *                      when it wants wi_scan_global_parametrics to stop
++ *                      scanning
++ * @param private_data  Anonymous pointer passed to cb
++ *
++ * @return              0: success, regcomp/regexec return value on error.
++ *                      See "man regexec" for possible errors
++ */
++
++int lp_wi_scan_global_parametrics(
++	const char *regex_str, size_t max_matches,
++	bool (*cb)(const char *string, regmatch_t matches[],
++		   void *private_data),
++	void *private_data)
++{
++	struct parmlist_entry *data;
++	regex_t regex;
++	int ret;
++
++	ret = regcomp(&regex, regex_str, REG_ICASE);
++	if (ret != 0) {
++		return ret;
++	}
++
++	for (data = Globals.param_opt; data != NULL; data = data->next) {
++		size_t keylen = strlen(data->key);
++		char key[keylen+1];
++		regmatch_t matches[max_matches];
++		bool stop;
++
++		memcpy(key, data->key, sizeof(key));
++		discard_whitespace(key);
++
++		ret = regexec(&regex, key, max_matches, matches, 0);
++		if (ret == REG_NOMATCH) {
++			continue;
++		}
++		if (ret != 0) {
++			goto fail;
++		}
++
++		stop = cb(key, matches, private_data);
++		if (stop) {
++			break;
++		}
++	}
++
++	ret = 0;
++fail:
++	regfree(&regex);
++	return ret;
++}
++
+ 
+ #define MISSING_PARAMETER(name) \
+     DEBUG(0, ("%s(): value is NULL or empty!\n", #name))
+-- 
+2.9.0
+
+
+From ef3701654107528530141bb9a66ee1209060f21c Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Thu, 22 Jan 2015 12:08:52 +0000
+Subject: [PATCH 02/14] winbind: Fix idmap initialization
+
+The fix is in the sscanf line: %u in the sscanf format mandates the use of
+a pointer to an "unsigned". idmap_domain->[low|high]_id are uint32_t. On
+little endian 64-bit this might at least put the correct values into
+low_id and high_id, but might overwrite the read_only bit set earlier,
+depending on structure alignment and packing. On big endian 64-bit,
+this will just fail.
+
+Automatic conversion to uint32_t will happen only at assignment, not
+when you take a pointer of such a thing.
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: Andreas Schneider <asn@samba.org>
+
+Autobuild-User(master): Andreas Schneider <asn@cryptomilk.org>
+Autobuild-Date(master): Thu Jan 22 17:58:16 CET 2015 on sn-devel-104
+
+(cherry picked from commit 63552f1c4c05a710143f12c2269754d0e547d945)
+---
+ source3/winbindd/idmap.c | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index a8beab7..841f710 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -172,6 +172,7 @@ static struct idmap_domain *idmap_init_domain(TALLOC_CTX *mem_ctx,
+ 	NTSTATUS status;
+ 	char *config_option = NULL;
+ 	const char *range;
++	unsigned low_id, high_id;
+ 
+ 	result = talloc_zero(mem_ctx, struct idmap_domain);
+ 	if (result == NULL) {
+@@ -230,23 +231,24 @@ static struct idmap_domain *idmap_init_domain(TALLOC_CTX *mem_ctx,
+ 				  result->name));
+ 			goto fail;
+ 		}
+-	} else if (sscanf(range, "%u - %u", &result->low_id,
+-			  &result->high_id) != 2)
++	} else if (sscanf(range, "%u - %u", &low_id, &high_id) != 2)
+ 	{
+ 		DEBUG(1, ("invalid range '%s' specified for domain "
+ 			  "'%s'\n", range, result->name));
+ 		if (check_range) {
+ 			goto fail;
+ 		}
+-	} else if (result->low_id > result->high_id) {
+-		DEBUG(1, ("Error: invalid idmap range detected: %lu - %lu\n",
+-			  (unsigned long)result->low_id,
+-			  (unsigned long)result->high_id));
++	} else if (low_id > high_id) {
++		DEBUG(1, ("Error: invalid idmap range detected: %u - %u\n",
++			  low_id, high_id));
+ 		if (check_range) {
+ 			goto fail;
+ 		}
+ 	}
+ 
++	result->low_id = low_id;
++	result->high_id = high_id;
++
+ 	status = result->methods->init(result);
+ 	if (!NT_STATUS_IS_OK(status)) {
+ 		DEBUG(1, ("idmap initialization returned %s\n",
+-- 
+2.9.0
+
+
+From ad0688f0b2ed0e060fa2c5a612d10bf4daa2e9cf Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Wed, 4 Mar 2015 10:22:48 +0100
+Subject: [PATCH 03/14] winbind: Fix CID 1273295 Uninitialized scalar variable
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: David Disseldorp <ddiss@samba.org>
+(cherry picked from commit 25928b1bcc031469c5321ab283a8d0c32dde2f4f)
+---
+ source3/winbindd/idmap.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index 841f710..70f4e02 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -172,7 +172,8 @@ static struct idmap_domain *idmap_init_domain(TALLOC_CTX *mem_ctx,
+ 	NTSTATUS status;
+ 	char *config_option = NULL;
+ 	const char *range;
+-	unsigned low_id, high_id;
++	unsigned low_id = 0;
++	unsigned high_id;
+ 
+ 	result = talloc_zero(mem_ctx, struct idmap_domain);
+ 	if (result == NULL) {
+-- 
+2.9.0
+
+
+From 940b73398d1e8847504db4d989ee548966f1e9c5 Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Wed, 4 Mar 2015 10:28:20 +0100
+Subject: [PATCH 04/14] winbind: Fix CID 1273294 Uninitialized scalar variable
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: David Disseldorp <ddiss@samba.org>
+(cherry picked from commit 8e195fb52ecfa3c263f68b74f989fb48a3c9116f)
+---
+ source3/winbindd/idmap.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index 70f4e02..1e2feb9 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -173,7 +173,7 @@ static struct idmap_domain *idmap_init_domain(TALLOC_CTX *mem_ctx,
+ 	char *config_option = NULL;
+ 	const char *range;
+ 	unsigned low_id = 0;
+-	unsigned high_id;
++	unsigned high_id = 0;
+ 
+ 	result = talloc_zero(mem_ctx, struct idmap_domain);
+ 	if (result == NULL) {
+-- 
+2.9.0
+
+
+From 461e69a3cb81247f0d514de865981ad56517d901 Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Tue, 18 Aug 2015 16:58:02 +0200
+Subject: [PATCH 05/14] idmap: Move idmap_init() under the static vars
+
+Just moving code, idmap_init will need to reference the variables
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+Bug: https://bugzilla.samba.org/show_bug.cgi?id=11464
+(cherry picked from commit d36de86639b7782e1e959d61917d8f19fdfc902c)
+---
+ source3/winbindd/idmap.c | 30 +++++++++++++++---------------
+ 1 file changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index 1e2feb9..0ba8fda 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -32,21 +32,6 @@
+ 
+ static_decl_idmap;
+ 
+-static void idmap_init(void)
+-{
+-	static bool initialized;
+-
+-	if (initialized) {
+-		return;
+-	}
+-
+-	DEBUG(10, ("idmap_init(): calling static_init_idmap\n"));
+-
+-	static_init_idmap;
+-
+-	initialized = true;
+-}
+-
+ /**
+  * Pointer to the backend methods. Modules register themselves here via
+  * smb_register_idmap.
+@@ -79,6 +64,21 @@ static struct idmap_domain *passdb_idmap_domain;
+ static struct idmap_domain **idmap_domains = NULL;
+ static int num_domains = 0;
+ 
++static void idmap_init(void)
++{
++	static bool initialized;
++
++	if (initialized) {
++		return;
++	}
++
++	DEBUG(10, ("idmap_init(): calling static_init_idmap\n"));
++
++	static_init_idmap;
++
++	initialized = true;
++}
++
+ static struct idmap_methods *get_methods(const char *name)
+ {
+ 	struct idmap_backend *b;
+-- 
+2.9.0
+
+
+From 5b3f88a29d5e9d6133f6a1e43e3db69dc6fdd1f2 Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Wed, 19 Aug 2015 17:00:46 +0200
+Subject: [PATCH 06/14] idmap: Initialize all idmap domains at startup
+
+So far we have initialized idmap domains on demand indexed by name.
+For sid2xid this works okay, because we could do lookupsids before
+and thus get the name. For xid2sid this is more problematic. We
+have to rely on enumtrustdoms to work completely, and we have to
+look at the list of winbind domains in the parent to get the domain
+name. Relying on domain->have_idmap_config is not particularly nice.
+
+This patch re-works initialization of idmap domains by scanning all
+parametric parameters, scanning for :backend configuration settings.
+This way we get a complete list of :range definitions. This means
+we can rely on the idmap domain array to be complete. This in turn
+means we can live without the domain name to find a domain, we can
+do a range search by uid or gid.
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+Bug: https://bugzilla.samba.org/show_bug.cgi?id=11464
+(cherry picked from commit ef0c91195533d95ba4fb7947ff5f69c20aa677b8)
+---
+ source3/winbindd/idmap.c | 199 ++++++++++++++++++++++++++---------------------
+ 1 file changed, 109 insertions(+), 90 deletions(-)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index 0ba8fda..40d87a7 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -64,12 +64,22 @@ static struct idmap_domain *passdb_idmap_domain;
+ static struct idmap_domain **idmap_domains = NULL;
+ static int num_domains = 0;
+ 
+-static void idmap_init(void)
++static struct idmap_domain *idmap_init_named_domain(TALLOC_CTX *mem_ctx,
++						    const char *domname);
++static struct idmap_domain *idmap_init_domain(TALLOC_CTX *mem_ctx,
++					      const char *domainname,
++					      const char *modulename,
++					      bool check_range);
++static bool idmap_found_domain_backend(
++	const char *string, regmatch_t matches[], void *private_data);
++
++static bool idmap_init(void)
+ {
+ 	static bool initialized;
++	int ret;
+ 
+ 	if (initialized) {
+-		return;
++		return true;
+ 	}
+ 
+ 	DEBUG(10, ("idmap_init(): calling static_init_idmap\n"));
+@@ -77,6 +87,80 @@ static void idmap_init(void)
+ 	static_init_idmap;
+ 
+ 	initialized = true;
++
++	if (!pdb_is_responsible_for_everything_else()) {
++		default_idmap_domain = idmap_init_named_domain(NULL, "*");
++		if (default_idmap_domain == NULL) {
++			return false;
++		}
++	}
++
++	passdb_idmap_domain = idmap_init_domain(
++		NULL, get_global_sam_name(), "passdb", false);
++	if (passdb_idmap_domain == NULL) {
++		TALLOC_FREE(default_idmap_domain);
++		return false;
++	}
++
++	idmap_domains = talloc_array(NULL, struct idmap_domain *, 0);
++	if (idmap_domains == NULL) {
++		TALLOC_FREE(passdb_idmap_domain);
++		TALLOC_FREE(default_idmap_domain);
++		return false;
++	}
++
++	ret = lp_wi_scan_global_parametrics(
++		"idmapconfig\\(.*\\):backend", 2,
++		idmap_found_domain_backend, NULL);
++	if (ret != 0) {
++		DEBUG(5, ("wi_scan_global_parametrics returned %d\n", ret));
++		return false;
++	}
++
++	return true;
++}
++
++static bool idmap_found_domain_backend(
++	const char *string, regmatch_t matches[], void *private_data)
++{
++	if (matches[1].rm_so == -1) {
++		DEBUG(5, ("Found match, but no name??\n"));
++		return false;
++	}
++
++	{
++		struct idmap_domain *dom, **tmp;
++		regoff_t len = matches[1].rm_eo - matches[1].rm_so;
++		char domname[len+1];
++
++		memcpy(domname, string + matches[1].rm_so, len);
++		domname[len] = '\0';
++
++		DEBUG(7, ("Found idmap domain \"%s\"\n", domname));
++
++		if (strcmp(domname, "*") == 0) {
++			return false;
++		}
++
++		dom = idmap_init_named_domain(idmap_domains, domname);
++		if (dom == NULL) {
++			DEBUG(3, ("Could not init idmap domain %s\n",
++				  domname));
++		}
++
++		tmp = talloc_realloc(idmap_domains, idmap_domains,
++				     struct idmap_domain *, num_domains + 1);
++		if (tmp == NULL) {
++			DEBUG(1, ("talloc_realloc failed\n"));
++			TALLOC_FREE(dom);
++			return false;
++		}
++		idmap_domains = tmp;
++		idmap_domains[num_domains] = dom;
++		num_domains += 1;
++	}
++
++	return false;
+ }
+ 
+ static struct idmap_methods *get_methods(const char *name)
+@@ -280,8 +364,12 @@ static struct idmap_domain *idmap_init_named_domain(TALLOC_CTX *mem_ctx,
+ 	struct idmap_domain *result = NULL;
+ 	char *config_option;
+ 	const char *backend;
++	bool ok;
+ 
+-	idmap_init();
++	ok = idmap_init();
++	if (!ok) {
++		return NULL;
++	}
+ 
+ 	config_option = talloc_asprintf(talloc_tos(), "idmap config %s",
+ 					domname);
+@@ -312,57 +400,6 @@ fail:
+ }
+ 
+ /**
+- * Initialize the default domain structure
+- * @param[in] mem_ctx		memory context for the result
+- * @result The default domain structure
+- *
+- * This routine takes the module name from the "idmap backend" parameter,
+- * passing a possible parameter like ldap:ldap://ldap-url/ to the module.
+- */
+-
+-static struct idmap_domain *idmap_init_default_domain(TALLOC_CTX *mem_ctx)
+-{
+-	return idmap_init_named_domain(mem_ctx, "*");
+-}
+-
+-/**
+- * Initialize the passdb domain structure
+- * @param[in] mem_ctx		memory context for the result
+- * @result The default domain structure
+- *
+- * No config, passdb has its own configuration.
+- */
+-
+-static struct idmap_domain *idmap_passdb_domain(TALLOC_CTX *mem_ctx)
+-{
+-	idmap_init();
+-
+-	if (!pdb_is_responsible_for_everything_else()) {
+-		/*
+-		 * Always init the default domain, we can't go without one
+-		 */
+-		if (default_idmap_domain == NULL) {
+-			default_idmap_domain = idmap_init_default_domain(NULL);
+-		}
+-		if (default_idmap_domain == NULL) {
+-			return NULL;
+-		}
+-	}
+-
+-	if (passdb_idmap_domain != NULL) {
+-		return passdb_idmap_domain;
+-	}
+-
+-	passdb_idmap_domain = idmap_init_domain(mem_ctx, get_global_sam_name(),
+-						"passdb", false);
+-	if (passdb_idmap_domain == NULL) {
+-		DEBUG(1, ("Could not init passdb idmap domain\n"));
+-	}
+-
+-	return passdb_idmap_domain;
+-}
+-
+-/**
+  * Find a domain struct according to a domain name
+  * @param[in] domname		Domain name to get the config for
+  * @result The default domain structure that fits
+@@ -379,21 +416,14 @@ static struct idmap_domain *idmap_passdb_domain(TALLOC_CTX *mem_ctx)
+ 
+ static struct idmap_domain *idmap_find_domain(const char *domname)
+ {
+-	struct idmap_domain *result;
++	bool ok;
+ 	int i;
+ 
+ 	DEBUG(10, ("idmap_find_domain called for domain '%s'\n",
+ 		   domname?domname:"NULL"));
+ 
+-	idmap_init();
+-
+-	/*
+-	 * Always init the default domain, we can't go without one
+-	 */
+-	if (default_idmap_domain == NULL) {
+-		default_idmap_domain = idmap_init_default_domain(NULL);
+-	}
+-	if (default_idmap_domain == NULL) {
++	ok = idmap_init();
++	if (!ok) {
+ 		return NULL;
+ 	}
+ 
+@@ -407,38 +437,21 @@ static struct idmap_domain *idmap_find_domain(const char *domname)
+ 		}
+ 	}
+ 
+-	if (idmap_domains == NULL) {
+-		/*
+-		 * talloc context for all idmap domains
+-		 */
+-		idmap_domains = talloc_array(NULL, struct idmap_domain *, 1);
+-	}
+-
+-	if (idmap_domains == NULL) {
+-		DEBUG(0, ("talloc failed\n"));
+-		return NULL;
+-	}
+-
+-	result = idmap_init_named_domain(idmap_domains, domname);
+-	if (result == NULL) {
+-		/*
+-		 * Could not init that domain -- try the default one
+-		 */
+-		return default_idmap_domain;
+-	}
+-
+-	ADD_TO_ARRAY(idmap_domains, struct idmap_domain *, result,
+-		     &idmap_domains, &num_domains);
+-	return result;
++	return default_idmap_domain;
+ }
+ 
+ struct idmap_domain *idmap_find_domain_with_sid(const char *domname,
+ 						const struct dom_sid *sid)
+ {
+-	idmap_init();
++	bool ok;
++
++	ok = idmap_init();
++	if (!ok) {
++		return NULL;
++	}
+ 
+ 	if (sid_check_is_for_passdb(sid)) {
+-		return idmap_passdb_domain(NULL);
++		return passdb_idmap_domain;
+ 	}
+ 
+ 	return idmap_find_domain(domname);
+@@ -493,6 +506,12 @@ NTSTATUS idmap_backends_unixid_to_sid(const char *domname, struct id_map *id)
+ {
+ 	struct idmap_domain *dom;
+ 	struct id_map *maps[2];
++	bool ok;
++
++	ok = idmap_init();
++	if (!ok) {
++		return NT_STATUS_NONE_MAPPED;
++	}
+ 
+ 	 DEBUG(10, ("idmap_backend_unixid_to_sid: domain = '%s', xid = %d "
+ 		    "(type %d)\n",
+@@ -505,7 +524,7 @@ NTSTATUS idmap_backends_unixid_to_sid(const char *domname, struct id_map *id)
+ 	 * Always give passdb a chance first
+ 	 */
+ 
+-	dom = idmap_passdb_domain(NULL);
++	dom = passdb_idmap_domain;
+ 	if ((dom != NULL)
+ 	    && NT_STATUS_IS_OK(dom->methods->unixids_to_sids(dom, maps))
+ 	    && id->status == ID_MAPPED) {
+-- 
+2.9.0
+
+
+From 808cde4e8490af596ec2c6d1df3a24c4e2b719cb Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Tue, 18 Aug 2015 17:30:27 +0200
+Subject: [PATCH 07/14] idmap: Use a range search in
+ idmap_backends_unixid_to_sid
+
+This obsoletes the domain name in the xid2sid calls
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+Bug: https://bugzilla.samba.org/show_bug.cgi?id=11464
+(cherry picked from commit ad626b9e6b3c200c70b0d840c956f7b6fff20660)
+---
+ source3/winbindd/idmap.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index 40d87a7..aff5792 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -507,6 +507,7 @@ NTSTATUS idmap_backends_unixid_to_sid(const char *domname, struct id_map *id)
+ 	struct idmap_domain *dom;
+ 	struct id_map *maps[2];
+ 	bool ok;
++	int i;
+ 
+ 	ok = idmap_init();
+ 	if (!ok) {
+@@ -531,7 +532,16 @@ NTSTATUS idmap_backends_unixid_to_sid(const char *domname, struct id_map *id)
+ 		return NT_STATUS_OK;
+ 	}
+ 
+-	dom = idmap_find_domain(domname);
++	dom = default_idmap_domain;
++
++	for (i=0; i<num_domains; i++) {
++		if ((id->xid.id >= idmap_domains[i]->low_id) &&
++		    (id->xid.id <= idmap_domains[i]->high_id)) {
++			dom = idmap_domains[i];
++			break;
++		}
++	}
++
+ 	if (dom == NULL) {
+ 		return NT_STATUS_NONE_MAPPED;
+ 	}
+-- 
+2.9.0
+
+
+From ebc02665c40d38fca33df001a4f660a18719e33b Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Tue, 18 Aug 2015 17:34:29 +0200
+Subject: [PATCH 08/14] idmap: Remove "domname" from
+ idmap_backends_unixid_to_sid
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: Stefan Metzmacher <metze@samba.org>
+Bug: https://bugzilla.samba.org/show_bug.cgi?id=11464
+(cherry picked from commit ac4cc243771fc3273872547087679db21c9bb1cb)
+---
+ source3/torture/test_idmap_tdb_common.c | 2 +-
+ source3/winbindd/idmap.c                | 8 ++++----
+ source3/winbindd/idmap_proto.h          | 3 +--
+ source3/winbindd/idmap_util.c           | 4 ++--
+ 4 files changed, 8 insertions(+), 9 deletions(-)
+
+diff --git a/source3/torture/test_idmap_tdb_common.c b/source3/torture/test_idmap_tdb_common.c
+index f7262a2..dd736ad 100644
+--- a/source3/torture/test_idmap_tdb_common.c
++++ b/source3/torture/test_idmap_tdb_common.c
+@@ -62,7 +62,7 @@ bool idmap_is_online(void)
+ 	return true;
+ }
+ 
+-NTSTATUS idmap_backends_unixid_to_sid(const char *domname, struct id_map *id)
++NTSTATUS idmap_backends_unixid_to_sid(struct id_map *id)
+ {
+ 	return NT_STATUS_OK;
+ }
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index aff5792..56ebf21 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -146,6 +146,7 @@ static bool idmap_found_domain_backend(
+ 		if (dom == NULL) {
+ 			DEBUG(3, ("Could not init idmap domain %s\n",
+ 				  domname));
++			return false;
+ 		}
+ 
+ 		tmp = talloc_realloc(idmap_domains, idmap_domains,
+@@ -502,7 +503,7 @@ NTSTATUS idmap_allocate_gid(struct unixid *id)
+ 	return idmap_allocate_unixid(id);
+ }
+ 
+-NTSTATUS idmap_backends_unixid_to_sid(const char *domname, struct id_map *id)
++NTSTATUS idmap_backends_unixid_to_sid(struct id_map *id)
+ {
+ 	struct idmap_domain *dom;
+ 	struct id_map *maps[2];
+@@ -514,9 +515,8 @@ NTSTATUS idmap_backends_unixid_to_sid(const char *domname, struct id_map *id)
+ 		return NT_STATUS_NONE_MAPPED;
+ 	}
+ 
+-	 DEBUG(10, ("idmap_backend_unixid_to_sid: domain = '%s', xid = %d "
+-		    "(type %d)\n",
+-		    domname?domname:"NULL", id->xid.id, id->xid.type));
++	DEBUG(10, ("idmap_backend_unixid_to_sid: xid = %d (type %d)\n",
++		   id->xid.id, id->xid.type));
+ 
+ 	maps[0] = id;
+ 	maps[1] = NULL;
+diff --git a/source3/winbindd/idmap_proto.h b/source3/winbindd/idmap_proto.h
+index f7af8ed..159aac6 100644
+--- a/source3/winbindd/idmap_proto.h
++++ b/source3/winbindd/idmap_proto.h
+@@ -34,8 +34,7 @@ NTSTATUS smb_register_idmap(int version, const char *name,
+ void idmap_close(void);
+ NTSTATUS idmap_allocate_uid(struct unixid *id);
+ NTSTATUS idmap_allocate_gid(struct unixid *id);
+-NTSTATUS idmap_backends_unixid_to_sid(const char *domname,
+-				      struct id_map *id);
++NTSTATUS idmap_backends_unixid_to_sid(struct id_map *id);
+ 
+ /* The following definitions come from winbindd/idmap_nss.c  */
+ 
+diff --git a/source3/winbindd/idmap_util.c b/source3/winbindd/idmap_util.c
+index e671acf..08857ab 100644
+--- a/source3/winbindd/idmap_util.c
++++ b/source3/winbindd/idmap_util.c
+@@ -66,7 +66,7 @@ backend:
+ 	map.xid.type = ID_TYPE_UID;
+ 	map.xid.id = uid;
+ 
+-	ret = idmap_backends_unixid_to_sid(domname, &map);
++	ret = idmap_backends_unixid_to_sid(&map);
+ 	if ( ! NT_STATUS_IS_OK(ret)) {
+ 		DEBUG(10, ("error mapping uid [%lu]: %s\n", (unsigned long)uid,
+ 			   nt_errstr(ret)));
+@@ -130,7 +130,7 @@ backend:
+ 	map.xid.type = ID_TYPE_GID;
+ 	map.xid.id = gid;
+ 
+-	ret = idmap_backends_unixid_to_sid(domname, &map);
++	ret = idmap_backends_unixid_to_sid(&map);
+ 	if ( ! NT_STATUS_IS_OK(ret)) {
+ 		DEBUG(10, ("error mapping gid [%lu]: %s\n", (unsigned long)gid,
+ 			   nt_errstr(ret)));
+-- 
+2.9.0
+
+
+From e7ca0730e3b3ba4eaa447b1ff487377978c70e64 Mon Sep 17 00:00:00 2001
+From: Michael Adam <obnox@samba.org>
+Date: Thu, 10 Mar 2016 10:38:29 +0100
+Subject: [PATCH 09/14] s3:winbindd:idmap: add domain_has_idmap_config() helper
+ function.
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11786
+
+Pair-Programmed-With: Guenther Deschner <gd@samba.org>
+
+Signed-off-by: Michael Adam <obnox@samba.org>
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Jeremy Allison <jra@samba.org>
+(cherry picked from commit fb80e1158bb1a14f2602e65464909a213296cde1)
+---
+ source3/winbindd/idmap.c          | 15 +++++++++++++++
+ source3/winbindd/winbindd_proto.h |  1 +
+ 2 files changed, 16 insertions(+)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index 56ebf21..7a96b92 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -120,6 +120,21 @@ static bool idmap_init(void)
+ 	return true;
+ }
+ 
++bool domain_has_idmap_config(const char *domname)
++{
++	int i;
++
++	idmap_init();
++
++	for (i=0; i<num_domains; i++) {
++		if (strequal(idmap_domains[i]->name, domname)) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ static bool idmap_found_domain_backend(
+ 	const char *string, regmatch_t matches[], void *private_data)
+ {
+diff --git a/source3/winbindd/winbindd_proto.h b/source3/winbindd/winbindd_proto.h
+index 42fffc0..85aee5b 100644
+--- a/source3/winbindd/winbindd_proto.h
++++ b/source3/winbindd/winbindd_proto.h
+@@ -339,6 +339,7 @@ void init_idmap_child(void);
+ struct winbindd_child *idmap_child(void);
+ struct idmap_domain *idmap_find_domain_with_sid(const char *domname,
+ 						const struct dom_sid *sid);
++bool domain_has_idmap_config(const char *domname);
+ 
+ /* The following definitions come from winbindd/winbindd_locator.c  */
+ 
+-- 
+2.9.0
+
+
+From d58905a6113fc0dc1e5cccb91568a550ee953999 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Thu, 10 Mar 2016 10:39:15 +0100
+Subject: [PATCH 10/14] s3:winbindd:idmap_hash: skip domains that already have
+ their own idmap configuration.
+
+Check if the domain from the list is not already configured to use another idmap
+backend. Not checking this makes the idmap_hash module map IDs for *all* domains
+implicitly. This is quite dangeorous in multi-idmap-config setups.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11786
+
+Pair-Programmed-With: Michael Adam <obnox@samba.org>
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Signed-off-by: Michael Adam <obnox@samba.org>
+Reviewed-by: Jeremy Allison <jra@samba.org>
+(cherry picked from commit 55be1ee69743c94d33f4244ade848517fc98e264)
+---
+ source3/winbindd/idmap_hash/idmap_hash.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/source3/winbindd/idmap_hash/idmap_hash.c b/source3/winbindd/idmap_hash/idmap_hash.c
+index 1dbd300..f77ee3b 100644
+--- a/source3/winbindd/idmap_hash/idmap_hash.c
++++ b/source3/winbindd/idmap_hash/idmap_hash.c
+@@ -137,6 +137,19 @@ static NTSTATUS be_init(struct idmap_domain *dom)
+ 
+ 		if (is_null_sid(&dom_list[i].sid))
+ 			continue;
++
++		/*
++		 * Check if the domain from the list is not already configured
++		 * to use another idmap backend. Not checking this makes the
++		 * idmap_hash module map IDs for *all* domains implicitly.  This
++		 * is quite dangerous in setups that use multiple idmap
++		 * configurations.
++		 */
++
++		if (domain_has_idmap_config(dom_list[i].domain_name)) {
++			continue;
++		}
++
+ 		if ((hash = hash_domain_sid(&dom_list[i].sid)) == 0)
+ 			continue;
+ 
+-- 
+2.9.0
+
+
+From 87079a86d35e298a7ec8a4476c5ff15c4c12d7ca Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?G=C3=BCnther=20Deschner?= <gd@samba.org>
+Date: Thu, 10 Mar 2016 12:21:52 +0100
+Subject: [PATCH 11/14] s3:winbindd:idmap: check loadparm in
+ domain_has_idmap_config() helper as well.
+
+Guenther
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11786
+
+Pair-Programmed-With: Michael Adam <obnox@samba.org>
+
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Signed-off-by: Michael Adam <obnox@samba.org>
+Reviewed-by: Jeremy Allison <jra@samba.org>
+(cherry picked from commit 4632ad98c4af5a4e0a2723c0cf716439e376e61f)
+---
+ source3/winbindd/idmap.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index 7a96b92..f716b6d 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -123,6 +123,9 @@ static bool idmap_init(void)
+ bool domain_has_idmap_config(const char *domname)
+ {
+ 	int i;
++	char *config_option;
++	const char *range = NULL;
++	const char *backend = NULL;
+ 
+ 	idmap_init();
+ 
+@@ -132,6 +135,25 @@ bool domain_has_idmap_config(const char *domname)
+ 		}
+ 	}
+ 
++	/* fallback: also check loadparm */
++
++	config_option = talloc_asprintf(talloc_tos(), "idmap config %s",
++					domname);
++	if (config_option == NULL) {
++		DEBUG(0, ("out of memory\n"));
++		return false;
++	}
++
++	range = lp_parm_const_string(-1, config_option, "range", NULL);
++	backend = lp_parm_const_string(-1, config_option, "backend", NULL);
++	if (range != NULL && backend != NULL) {
++		DEBUG(5, ("idmap configuration specified for domain '%s'\n",
++			domname));
++		TALLOC_FREE(config_option);
++		return true;
++	}
++
++	TALLOC_FREE(config_option);
+ 	return false;
+ }
+ 
+-- 
+2.9.0
+
+
+From d80f66cf98e47a7a8dfc8dd27c8c36529e36d235 Mon Sep 17 00:00:00 2001
+From: Michael Adam <obnox@samba.org>
+Date: Mon, 14 Mar 2016 17:06:34 +0100
+Subject: [PATCH 12/14] idmap_hash: rename be_init() -->
+ idmap_hash_initialize()
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11786
+
+Pair-Programmed-With: Guenther Deschner <gd@samba.org>
+
+Signed-off-by: Michael Adam <obnox@samba.org>
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Jeremy Allison <jra@samba.org>
+(cherry picked from commit 4172491cbe7bb8ad2a7089efe15fbe46fcc123fb)
+---
+ source3/winbindd/idmap_hash/idmap_hash.c | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/source3/winbindd/idmap_hash/idmap_hash.c b/source3/winbindd/idmap_hash/idmap_hash.c
+index f77ee3b..773d5a9 100644
+--- a/source3/winbindd/idmap_hash/idmap_hash.c
++++ b/source3/winbindd/idmap_hash/idmap_hash.c
+@@ -104,7 +104,7 @@ static void separate_hashes(uint32_t id,
+ /*********************************************************************
+  ********************************************************************/
+ 
+-static NTSTATUS be_init(struct idmap_domain *dom)
++static NTSTATUS idmap_hash_initialize(struct idmap_domain *dom)
+ {
+ 	struct sid_hash_table *hashed_domains;
+ 	NTSTATUS nt_status = NT_STATUS_UNSUCCESSFUL;
+@@ -153,10 +153,10 @@ static NTSTATUS be_init(struct idmap_domain *dom)
+ 		if ((hash = hash_domain_sid(&dom_list[i].sid)) == 0)
+ 			continue;
+ 
+-		DEBUG(5,("hash:be_init() Adding %s (%s) -> %d\n",
+-			 dom_list[i].domain_name,
+-			 sid_string_dbg(&dom_list[i].sid),
+-			 hash));
++		DEBUG(3, ("Adding %s (%s) -> %d\n",
++			  dom_list[i].domain_name,
++			  sid_string_dbg(&dom_list[i].sid),
++			  hash));
+ 
+ 		hashed_domains[hash].sid = talloc(hashed_domains, struct dom_sid);
+ 		sid_copy(hashed_domains[hash].sid, &dom_list[i].sid);
+@@ -189,7 +189,7 @@ static NTSTATUS unixids_to_sids(struct idmap_domain *dom,
+ 		ids[i]->status = ID_UNKNOWN;
+ 	}
+ 
+-	nt_status = be_init(dom);
++	nt_status = idmap_hash_initialize(dom);
+ 	BAIL_ON_NTSTATUS_ERROR(nt_status);
+ 
+ 	for (i=0; ids[i]; i++) {
+@@ -239,7 +239,7 @@ static NTSTATUS sids_to_unixids(struct idmap_domain *dom,
+ 		ids[i]->status = ID_UNKNOWN;
+ 	}
+ 
+-	nt_status = be_init(dom);
++	nt_status = idmap_hash_initialize(dom);
+ 	BAIL_ON_NTSTATUS_ERROR(nt_status);
+ 
+ 	for (i=0; ids[i]; i++) {
+@@ -360,7 +360,7 @@ static NTSTATUS nss_hash_close(void)
+ ********************************************************************/
+ 
+ static struct idmap_methods hash_idmap_methods = {
+-	.init            = be_init,
++	.init            = idmap_hash_initialize,
+ 	.unixids_to_sids = unixids_to_sids,
+ 	.sids_to_unixids = sids_to_unixids,
+ };
+-- 
+2.9.0
+
+
+From e4216d31e54d9936b021bf57fbaeddfcd8731995 Mon Sep 17 00:00:00 2001
+From: Michael Adam <obnox@samba.org>
+Date: Mon, 14 Mar 2016 17:07:34 +0100
+Subject: [PATCH 13/14] idmap_hash: only allow the hash module for default
+ idmap config.
+
+BUG: https://bugzilla.samba.org/show_bug.cgi?id=11786
+
+This module only makes sense as the default idmap config
+("idmap config * : backend = hash" ...)
+
+Pair-Programmed-With: Guenther Deschner <gd@samba.org>
+
+Signed-off-by: Michael Adam <obnox@samba.org>
+Signed-off-by: Guenther Deschner <gd@samba.org>
+Reviewed-by: Jeremy Allison <jra@samba.org>
+(cherry picked from commit a16379c585a6f6e9470a8745b6043be8171eb615)
+---
+ source3/winbindd/idmap_hash/idmap_hash.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/source3/winbindd/idmap_hash/idmap_hash.c b/source3/winbindd/idmap_hash/idmap_hash.c
+index 773d5a9..b3aab86 100644
+--- a/source3/winbindd/idmap_hash/idmap_hash.c
++++ b/source3/winbindd/idmap_hash/idmap_hash.c
+@@ -112,6 +112,13 @@ static NTSTATUS idmap_hash_initialize(struct idmap_domain *dom)
+ 	size_t num_domains = 0;
+ 	int i;
+ 
++	if (!strequal(dom->name, "*")) {
++		DEBUG(0, ("Error: idmap_hash configured for domain '%s'. "
++			  "But the hash module can only be used for the default "
++			  "idmap configuration.\n", dom->name));
++		return NT_STATUS_INVALID_PARAMETER;
++	}
++
+ 	/* If the domain SID hash table has been initialized, assume
+ 	   that we completed this function previously */
+ 
+-- 
+2.9.0
+
+
+From 11a3354fcd7ff4bf6cd2cdb18e05b12c1ebc6cfd Mon Sep 17 00:00:00 2001
+From: Volker Lendecke <vl@samba.org>
+Date: Tue, 22 Mar 2016 11:24:23 +0100
+Subject: [PATCH 14/14] winbind: Fix CID 1357100 Unchecked return value
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Volker Lendecke <vl@samba.org>
+Reviewed-by: Ralph Boehme <slow@samba.org>
+
+Autobuild-User(master): Ralph Böhme <slow@samba.org>
+Autobuild-Date(master): Tue Mar 22 15:49:14 CET 2016 on sn-devel-144
+
+(cherry picked from commit 5291462bd8a683b2d21b5f21ad73f84939aa2d67)
+---
+ source3/winbindd/idmap.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/source3/winbindd/idmap.c b/source3/winbindd/idmap.c
+index f716b6d..158fa81 100644
+--- a/source3/winbindd/idmap.c
++++ b/source3/winbindd/idmap.c
+@@ -126,8 +126,12 @@ bool domain_has_idmap_config(const char *domname)
+ 	char *config_option;
+ 	const char *range = NULL;
+ 	const char *backend = NULL;
++	bool ok;
+ 
+-	idmap_init();
++	ok = idmap_init();
++	if (!ok) {
++		return false;
++	}
+ 
+ 	for (i=0; i<num_domains; i++) {
+ 		if (strequal(idmap_domains[i]->name, domname)) {
+-- 
+2.9.0
+
